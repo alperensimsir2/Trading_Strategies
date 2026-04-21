@@ -11,6 +11,10 @@ on:
         required: false
         default: "false"
 
+# Permissions needed for the gh-pages deploy action to push to the gh-pages branch.
+permissions:
+  contents: write
+
 jobs:
   compute:
     runs-on: ubuntu-latest
@@ -29,11 +33,10 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          pip install -r requirements.txt pyarrow
 
-      # Restore the ticker history cache across runs. The cache key changes
-      # daily so we always write a fresh entry, while restore-keys falls back
-      # to yesterday's cache on cache-miss.
+      # Restore ticker history cache across runs. Daily key ensures we always
+      # write a fresh entry; restore-keys fall back to yesterday's cache.
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -59,32 +62,13 @@ jobs:
           path: out/
           retention-days: 7
 
-      # ---- Option A: deploy to Cloudflare R2 (recommended) -----------------
-      # Uncomment after adding R2 secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
-      # R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME.
-      #
-      # - name: Configure AWS CLI for R2
-      #   run: |
-      #     aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
-      #     aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
-      #     aws configure set region auto
-      #
-      # - name: Sync to R2
-      #   env:
-      #     R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
-      #   run: |
-      #     aws s3 sync out/ s3://${{ secrets.R2_BUCKET_NAME }}/ \
-      #       --endpoint-url "$R2_ENDPOINT" \
-      #       --cache-control "public, max-age=3600" \
-      #       --delete
-
-      # ---- Option B: deploy to gh-pages -----------------------------------
-      # Uncomment if you prefer gh-pages over R2.
-      #
-      # - name: Deploy to gh-pages
-      #   uses: peaceiris/actions-gh-pages@v4
-      #   with:
-      #     github_token: ${{ secrets.GITHUB_TOKEN }}
-      #     publish_dir: ./out
-      #     publish_branch: gh-pages
-      #     keep_files: false
+      - name: Deploy to gh-pages
+        uses: peaceiris/actions-gh-pages@v4
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
+          publish_dir: ./out
+          publish_branch: gh-pages
+          keep_files: false
+          user_name: github-actions[bot]
+          user_email: github-actions[bot]@users.noreply.github.com
+          commit_message: "Publish signals for ${{ github.run_id }}"
