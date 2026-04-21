@@ -2,8 +2,7 @@ name: daily-signals
 
 on:
   schedule:
-    # 00:30 UTC Tue–Sat = ~3.5h after US market close in both EDT and EST.
-    - cron: "30 0 * * 2-6"
+    - cron: "0 23 * * 1-5"
   workflow_dispatch:
     inputs:
       backfill:
@@ -11,14 +10,13 @@ on:
         required: false
         default: "false"
 
-# Permissions needed for the gh-pages deploy action to push to the gh-pages branch.
 permissions:
   contents: write
 
 jobs:
   compute:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout
@@ -33,10 +31,8 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install -r requirements.txt pyarrow
+          pip install -r requirements.txt pyarrow pandas_market_calendars
 
-      # Restore ticker history cache across runs. Daily key ensures we always
-      # write a fresh entry; restore-keys fall back to yesterday's cache.
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -45,7 +41,26 @@ jobs:
           restore-keys: |
             ticker-cache-
 
+      - name: Check if market is open day
+        id: market_day
+        run: |
+          python - <<EOF
+          import datetime
+          import pandas_market_calendars as mcal
+
+          nyse = mcal.get_calendar("NYSE")
+          today = datetime.datetime.utcnow().date()
+          schedule = nyse.schedule(start_date=today, end_date=today)
+
+          is_open = "true" if not schedule.empty else "false"
+          print(f"is_open={is_open}")
+
+          with open("${{ github.env }}", "a") as f:
+              f.write(f"MARKET_OPEN={is_open}\n")
+          EOF
+
       - name: Run pipeline
+        if: env.MARKET_OPEN == 'true'
         env:
           EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
         run: |
@@ -56,6 +71,7 @@ jobs:
           fi
 
       - name: Upload artifact (debugging)
+        if: env.MARKET_OPEN == 'true'
         uses: actions/upload-artifact@v4
         with:
           name: signals-${{ github.run_id }}
@@ -63,6 +79,7 @@ jobs:
           retention-days: 7
 
       - name: Deploy to gh-pages
+        if: env.MARKET_OPEN == 'true'
         uses: peaceiris/actions-gh-pages@v4
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
