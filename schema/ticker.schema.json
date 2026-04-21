@@ -1,0 +1,76 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yourdomain.example/schema/ticker.schema.json",
+  "title": "TickerHistory",
+  "description": "Per-ticker history for the detail screen. One object per bar.",
+  "type": "object",
+  "required": ["ticker", "schema_version", "history"],
+  "properties": {
+    "ticker":         { "type": "string" },
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "history": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/HistoryBar" }
+    }
+  },
+  "$defs": {
+    "StrategySignal": {
+      "type": "string",
+      "enum": ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]
+    },
+    "FinalSignal": {
+      "type": "string",
+      "enum": ["STRONG BUY", "BUY", "WEAK BUY", "HOLD", "NO SIGNAL",
+               "WEAK SELL", "SELL", "STRONG SELL"]
+    },
+    "HistoryBar": {
+      "type": "object",
+      "required": ["date", "close", "strategies", "scores", "final_signal", "indicators"],
+      "properties": {
+        "date":   { "type": "string", "format": "date" },
+        "close":  { "type": ["number", "null"] },
+        "volume": { "type": ["integer", "null"] },
+        "strategies": {
+          "type": "object",
+          "required": ["trend", "range", "reversal", "momentum"],
+          "properties": {
+            "trend":    { "$ref": "#/$defs/StrategySignal" },
+            "range":    { "$ref": "#/$defs/StrategySignal" },
+            "reversal": { "$ref": "#/$defs/StrategySignal" },
+            "momentum": { "$ref": "#/$defs/StrategySignal" }
+          }
+        },
+        "scores": {
+          "type": "object",
+          "properties": {
+            "trend":    { "type": ["number", "null"] },
+            "range":    { "type": ["number", "null"] },
+            "reversal": { "type": ["number", "null"] },
+            "momentum": { "type": ["number", "null"] }
+          }
+        },
+        "final_signal": { "$ref": "#/$defs/FinalSignal" },
+        "indicators": {
+          "type": "object",
+          "properties": {
+            "sma20":       { "type": ["number", "null"] },
+            "sma50":       { "type": ["number", "null"] },
+            "sma100":      { "type": ["number", "null"] },
+            "sma200":      { "type": ["number", "null"] },
+            "bb_upper":    { "type": ["number", "null"] },
+            "bb_lower":    { "type": ["number", "null"] },
+            "rsi14":       { "type": ["number", "null"] },
+            "macd":        { "type": ["number", "null"] },
+            "macd_signal": { "type": ["number", "null"] },
+            "macd_hist":   { "type": ["number", "null"] },
+            "adx14":       { "type": ["number", "null"] },
+            "atr14":       { "type": ["number", "null"] },
+            "stoch_k":     { "type": ["number", "null"] },
+            "stoch_d":     { "type": ["number", "null"] },
+            "zscore":      { "type": ["number", "null"] }
+          }
+        }
+      }
+    }
+  }
+}

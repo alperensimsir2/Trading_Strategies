@@ -1,0 +1,90 @@
+name: daily-signals
+
+on:
+  schedule:
+    # 00:30 UTC Tue–Sat = ~3.5h after US market close in both EDT and EST.
+    - cron: "30 0 * * 2-6"
+  workflow_dispatch:
+    inputs:
+      backfill:
+        description: "Run full backfill (first time or after long outage)"
+        required: false
+        default: "false"
+
+jobs:
+  compute:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # Restore the ticker history cache across runs. The cache key changes
+      # daily so we always write a fresh entry, while restore-keys falls back
+      # to yesterday's cache on cache-miss.
+      - name: Restore cache
+        uses: actions/cache@v4
+        with:
+          path: cache
+          key: ticker-cache-${{ github.run_id }}
+          restore-keys: |
+            ticker-cache-
+
+      - name: Run pipeline
+        env:
+          EODHD_API_KEY: ${{ secrets.EODHD_API_KEY }}
+        run: |
+          if [ "${{ github.event.inputs.backfill }}" = "true" ]; then
+            python -m src --backfill
+          else
+            python -m src
+          fi
+
+      - name: Upload artifact (debugging)
+        uses: actions/upload-artifact@v4
+        with:
+          name: signals-${{ github.run_id }}
+          path: out/
+          retention-days: 7
+
+      # ---- Option A: deploy to Cloudflare R2 (recommended) -----------------
+      # Uncomment after adding R2 secrets: R2_ACCOUNT_ID, R2_ACCESS_KEY_ID,
+      # R2_SECRET_ACCESS_KEY, R2_BUCKET_NAME.
+      #
+      # - name: Configure AWS CLI for R2
+      #   run: |
+      #     aws configure set aws_access_key_id "${{ secrets.R2_ACCESS_KEY_ID }}"
+      #     aws configure set aws_secret_access_key "${{ secrets.R2_SECRET_ACCESS_KEY }}"
+      #     aws configure set region auto
+      #
+      # - name: Sync to R2
+      #   env:
+      #     R2_ENDPOINT: https://${{ secrets.R2_ACCOUNT_ID }}.r2.cloudflarestorage.com
+      #   run: |
+      #     aws s3 sync out/ s3://${{ secrets.R2_BUCKET_NAME }}/ \
+      #       --endpoint-url "$R2_ENDPOINT" \
+      #       --cache-control "public, max-age=3600" \
+      #       --delete
+
+      # ---- Option B: deploy to gh-pages -----------------------------------
+      # Uncomment if you prefer gh-pages over R2.
+      #
+      # - name: Deploy to gh-pages
+      #   uses: peaceiris/actions-gh-pages@v4
+      #   with:
+      #     github_token: ${{ secrets.GITHUB_TOKEN }}
+      #     publish_dir: ./out
+      #     publish_branch: gh-pages
+      #     keep_files: false

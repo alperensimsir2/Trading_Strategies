@@ -1,0 +1,62 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yourdomain.example/schema/signals.schema.json",
+  "title": "SignalsPayload",
+  "description": "Home-screen payload: one row per ticker with its latest signal.",
+  "type": "object",
+  "required": ["schema_version", "generated_at", "trade_date", "universe_size", "signals"],
+  "properties": {
+    "schema_version": { "type": "string", "pattern": "^\\d+\\.\\d+\\.\\d+$" },
+    "generated_at":   { "type": "string", "format": "date-time",
+                        "description": "UTC ISO 8601 timestamp when this file was produced." },
+    "trade_date":     { "type": "string", "format": "date",
+                        "description": "The trading date the signals apply to (NYSE date)." },
+    "universe_size":  { "type": "integer", "minimum": 0 },
+    "signals": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/SignalRow" }
+    }
+  },
+  "$defs": {
+    "StrategySignal": {
+      "type": "string",
+      "enum": ["STRONG BUY", "BUY", "HOLD", "SELL", "STRONG SELL"]
+    },
+    "FinalSignal": {
+      "type": "string",
+      "enum": ["STRONG BUY", "BUY", "WEAK BUY", "HOLD", "NO SIGNAL",
+               "WEAK SELL", "SELL", "STRONG SELL"]
+    },
+    "SignalRow": {
+      "type": "object",
+      "required": ["ticker", "close", "final_signal", "strategies", "scores"],
+      "properties": {
+        "ticker":        { "type": "string" },
+        "close":         { "type": ["number", "null"] },
+        "change_pct":    { "type": ["number", "null"],
+                           "description": "Percent change vs prior close." },
+        "final_signal":  { "$ref": "#/$defs/FinalSignal" },
+        "strategies": {
+          "type": "object",
+          "required": ["trend", "range", "reversal", "momentum"],
+          "properties": {
+            "trend":    { "$ref": "#/$defs/StrategySignal" },
+            "range":    { "$ref": "#/$defs/StrategySignal" },
+            "reversal": { "$ref": "#/$defs/StrategySignal" },
+            "momentum": { "$ref": "#/$defs/StrategySignal" }
+          }
+        },
+        "scores": {
+          "type": "object",
+          "required": ["trend", "range", "reversal", "momentum"],
+          "properties": {
+            "trend":    { "type": ["number", "null"] },
+            "range":    { "type": ["number", "null"] },
+            "reversal": { "type": ["number", "null"] },
+            "momentum": { "type": ["number", "null"] }
+          }
+        }
+      }
+    }
+  }
+}
