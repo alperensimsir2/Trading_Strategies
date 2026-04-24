@@ -1,11 +1,59 @@
 """
 End-to-end pipeline:
-  1. Load cached OHLCV per ticker (or backfill if missing).
-  2. Apply the bulk-day append.
-  3. Compute indicators per ticker on adjusted close + raw H/L/C.
-  4. Score each of the four strategies for every bar.
-  5. Combine into a final consensus signal.
-  6. Write signals.json (latest row per ticker) and tickers/{T}.json (history).
+
+  1. Ensure OHLCV cache per ticker (backfill if needed).
+  2. Append today's bulk day.
+  3. Compute indicators per ticker.
+  4. Run primary + secondary strategies.
+  5. Apply PSAR alignment filter.
+  6. Expand entries into persistent BUY/SELL/None state.
+  7. Compute per-ticker success rate + current position strength.
+  8. Write signals.json (home-screen payload) and tickers/{T}.json.
+
+Schema (v2.0.0) output fields:
+
+signals.json:
+  {
+    "schema_version": "2.0.0",
+    "generated_at": "...Z",
+    "trade_date": "YYYY-MM-DD",
+    "universe_size": N,
+    "strategy_success_rate_52w": 0.68 or null,
+    "strategy_trade_count_52w": 2847,
+    "signals": [
+      {
+        "ticker": "AAPL",
+        "close": 273.17,
+        "change_pct": 0.09,
+        "signal": "BUY" | "SELL" | null,
+        "signal_source": "primary" | "secondary" | null,
+        "signal_started_date": "YYYY-MM-DD" | null,
+        "signal_trading_days": 5 | null,
+        "position_strength": "Strong" | "Moderate" | "Close to flipping" | null,
+        "ticker_success_rate_52w": 0.73 | null,
+        "ticker_trade_count_52w": 8
+      },
+      ...
+    ]
+  }
+
+tickers/AAPL.json:
+  {
+    "ticker": "AAPL",
+    "schema_version": "2.0.0",
+    "current": {...same as above minus ticker...},
+    "success_rate": {"success_rate": 0.73, "trade_count": 8},
+    "history": [
+      {
+        "date": "YYYY-MM-DD",
+        "close": 273.17,
+        "volume": 50000000,
+        "signal": "BUY"|"SELL"|null,
+        "psar": 245.3
+      },
+      ...
+    ]
+  }
 """
 
 from __future__ import annotations
@@ -20,93 +68,45 @@ import pandas as pd
 from . import consensus, fetch, indicators as ind, strategies as strat
 
 
-SCHEMA_VERSION = "1.0.0"
+SCHEMA_VERSION = "2.0.0"
+
+# Match the PHP: 260 trading days = 52 weeks of trading.
+SUCCESS_WINDOW_BARS = 260
+# Need enough bars to let pivots (±15+4) and PSAR warm up. The bars BEFORE the
+# 260-window are used purely as warm-up so the 260 bars all have valid
+# indicators; we only evaluate signals on the 260-window itself.
+WARMUP_BARS = 60
 
 
 def compute_indicators(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Attach every indicator column the strategies need.
+    Compute only what the new strategy needs:
+      - MACD line (12/26/9) on adjusted close
+      - 14,3,3 slow stochastic on raw H/L/C
+      - PSAR (Wilder defaults) on raw H/L
 
-    Price basis convention (matches the Excel reference):
-      - Smoothing / momentum indicators (SMA, EMA, RSI, MACD, BB bands themselves,
-        Z-score baseline) use ADJUSTED close for dividend stability.
-      - "Chart-visible" comparisons (BB position: is today's close above the upper
-        band? Z-score: how far is today's close from SMA50?) use RAW close, because
-        those are the prices a human sees on their chart.
-      - H/L/C indicators (ADX, Stoch, ATR) use RAW as per spec.
-
-    This deliberately mixes two price series for BB-position and Z-score. It is
-    the convention the reference workbook uses; matching it keeps the pipeline's
-    output in parity with that workbook. For tickers that have paid dividends,
-    raw close > adjusted close, so BB/Z-score signals fire slightly more often
-    than a purely-adjusted implementation would show.
+    The strategy layer also uses `high`, `low`, `close` — these come straight
+    from the input df and are kept untouched.
     """
     df = df.copy()
-
     adj = df["adj_close"]
-    raw = df["close"]
 
-    # Adjusted-close smoothers.
-    df["sma20"] = ind.sma(adj, 20)
-    df["sma50"] = ind.sma(adj, 50)
-    df["sma100"] = ind.sma(adj, 100)
-    df["sma200"] = ind.sma(adj, 200)
-    df["bb_upper"], df["bb_mid"], df["bb_lower"] = ind.bollinger(adj, 20, 2)
-    df["rsi14"] = ind.rsi(adj, 14)
-    df["macd"], df["macd_signal"], df["macd_hist"] = ind.macd(adj, 12, 26, 9)
+    # MACD on adjusted close.
+    macd_line, macd_signal, _ = ind.macd(adj, 12, 26, 9)
+    df["macd"] = macd_line
+    # (macd_signal + hist are computed but unused by the pivot strategy; drop.)
 
-    # Z-score: Dev = (raw_close - SMA50_of_adj) / SMA50_of_adj. Mixes series.
-    df["zscore"] = ind.zscore_dev(raw, df["sma50"], 60)
-
-    # Raw H/L/C indicators.
-    df["stoch_k"] = ind.stoch_k(df["high"], df["low"], df["close"], 14)
+    # 14,3,3 slow stochastic on raw H/L/C.
+    df["stoch_k"] = ind.stoch_slow_k(df["high"], df["low"], df["close"], 14, 3)
     df["stoch_d"] = ind.stoch_d(df["stoch_k"], 3)
-    df["adx14"], df["plus_di"], df["minus_di"] = ind.adx(
-        df["high"], df["low"], df["close"], 14
-    )
-    df["atr14"] = ind.atr(df["high"], df["low"], df["close"], 14)
 
-    # Strategies see `close` = RAW close for BB-position checks, consistent with
-    # the Excel. Preserve adjusted close separately for anything that needs it.
-    df["close_adj"] = adj
-    # close stays as raw (already in the frame)
+    # Parabolic SAR on raw H/L.
+    df["psar"] = ind.parabolic_sar(df["high"], df["low"])
 
-    return df
-
-
-def compute_signals(df: pd.DataFrame) -> pd.DataFrame:
-    """Attach per-bar strategy scores, per-bar signals, and the final signal."""
-    df = df.copy()
-
-    # Trend + Range are per-row; Reversal + Momentum need lookbacks.
-    df["score_trend"] = df.apply(strat.trend_score, axis=1)
-    df["score_range"] = df.apply(strat.range_score, axis=1)
-
-    rev = []
-    mom = []
-    for i in range(len(df)):
-        rev.append(strat.reversal_score_row(i, df))
-        mom.append(strat.momentum_score_row(i, df))
-    df["score_reversal"] = rev
-    df["score_momentum"] = mom
-
-    for name in ("trend", "range", "reversal", "momentum"):
-        df[f"sig_{name}"] = df[f"score_{name}"].apply(strat.signal_from_score)
-
-    def _consensus(row):
-        return consensus.final_signal({
-            "trend": row["sig_trend"],
-            "range": row["sig_range"],
-            "reversal": row["sig_reversal"],
-            "momentum": row["sig_momentum"],
-        })
-
-    df["final_signal"] = df.apply(_consensus, axis=1)
     return df
 
 
 def _safe_num(x):
-    """JSON-friendly number: None for NaN/inf, rounded float otherwise."""
     if x is None:
         return None
     try:
@@ -117,93 +117,108 @@ def _safe_num(x):
     return round(float(x), 4)
 
 
-def _row_to_history(row: pd.Series) -> dict:
-    """One row of per-ticker history, as it goes into tickers/{T}.json."""
-    return {
-        "date": row["date"].strftime("%Y-%m-%d"),
-        "close": _safe_num(row["close"]),
-        "volume": int(row["volume"]) if pd.notna(row["volume"]) else None,
-        "strategies": {
-            "trend": row["sig_trend"],
-            "range": row["sig_range"],
-            "reversal": row["sig_reversal"],
-            "momentum": row["sig_momentum"],
-        },
-        "scores": {
-            "trend": _safe_num(row["score_trend"]),
-            "range": _safe_num(row["score_range"]),
-            "reversal": _safe_num(row["score_reversal"]),
-            "momentum": _safe_num(row["score_momentum"]),
-        },
-        "final_signal": row["final_signal"],
-        "indicators": {
-            "sma20": _safe_num(row["sma20"]),
-            "sma50": _safe_num(row["sma50"]),
-            "sma100": _safe_num(row["sma100"]),
-            "sma200": _safe_num(row["sma200"]),
-            "bb_upper": _safe_num(row["bb_upper"]),
-            "bb_lower": _safe_num(row["bb_lower"]),
-            "rsi14": _safe_num(row["rsi14"]),
-            "macd": _safe_num(row["macd"]),
-            "macd_signal": _safe_num(row["macd_signal"]),
-            "macd_hist": _safe_num(row["macd_hist"]),
-            "adx14": _safe_num(row["adx14"]),
-            "atr14": _safe_num(row["atr14"]),
-            "stoch_k": _safe_num(row["stoch_k"]),
-            "stoch_d": _safe_num(row["stoch_d"]),
-            "zscore": _safe_num(row["zscore"]),
-        },
-    }
-
-
-def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict] | None:
-    """
-    Returns (summary, history). `summary` is one row for signals.json,
-    `history` is the full JSON blob for tickers/{T}.json. Returns None if the
-    ticker has insufficient data (e.g. newly listed, <200 bars).
-    """
-    if df.empty or len(df) < 100:
+def _latest_change_pct(df: pd.DataFrame) -> float | None:
+    if len(df) < 2:
         return None
+    latest_close = df["close"].iloc[-1]
+    prev_close = df["close"].iloc[-2]
+    if pd.isna(latest_close) or pd.isna(prev_close) or prev_close == 0:
+        return None
+    return round(float((latest_close / prev_close - 1.0) * 100.0), 4)
+
+
+def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict, list[dict]] | None:
+    """
+    Run the strategy for one ticker.
+
+    Returns (summary, history_payload, trades). summary is a row for signals.json;
+    history_payload is the per-ticker file; trades is the list of completed
+    trades in the 52w window (used to aggregate strategy-wide success rate).
+
+    Returns None if the ticker has too little history.
+    """
+    if df.empty or len(df) < WARMUP_BARS + 20:
+        return None
+
+    # Compute indicators on the full cached history (necessary for MACD/PSAR
+    # to warm up), then trim to the success-rate window for signal evaluation.
+    df = df.sort_values("date").reset_index(drop=True)
     df = compute_indicators(df)
-    df = compute_signals(df)
 
-    # Only emit rows where final signal is defined (needs SMA100 at minimum).
-    df = df.dropna(subset=["score_momentum"])
-    if df.empty:
+    # Evaluate signals on the whole series (cheap), but we'll slice to the
+    # 260-bar window for state/trade computations. This ensures any "recent"
+    # signal still sees the full indicator warm-up behind it.
+    df_full = df.copy()
+
+    # Strategy layer expects columns: date, high, low, close, macd, stoch_k, stoch_d, psar.
+    primary = strat.compute_primary_signals(df_full)
+    primary = strat.apply_psar_alignment_filter(df_full, primary)
+    secondary = strat.compute_trending_stocks_signals(df_full)
+
+    # Slice to the 52-week window for state expansion + success rate. If we
+    # have less than SUCCESS_WINDOW_BARS available, use everything we have.
+    window = df_full.tail(SUCCESS_WINDOW_BARS).reset_index(drop=True)
+
+    # Filter the entry dicts down to only dates in the window.
+    window_dates = set(window["date"].astype(str).str[:10])
+    primary_win = {d: v for d, v in primary.items() if d in window_dates}
+    secondary_win = {d: v for d, v in secondary.items() if d in window_dates}
+
+    result = consensus.process_ticker_signals(window, primary_win, secondary_win)
+    if not result["active_status"]:
         return None
 
-    latest = df.iloc[-1]
-    if len(df) >= 2:
-        prev_close = df["close"].iloc[-2]
-        change_pct = (latest["close"] / prev_close - 1) * 100 if prev_close else None
-    else:
-        change_pct = None
+    current = result["current"]
+    sr = result["success_rate"]
 
+    latest_date_str = result["active_status"][-1]["date"]
     summary = {
         "ticker": ticker,
-        "close": _safe_num(latest["close"]),
-        "change_pct": _safe_num(change_pct),
-        "final_signal": latest["final_signal"],
-        "strategies": {
-            "trend": latest["sig_trend"],
-            "range": latest["sig_range"],
-            "reversal": latest["sig_reversal"],
-            "momentum": latest["sig_momentum"],
-        },
-        "scores": {
-            "trend": _safe_num(latest["score_trend"]),
-            "range": _safe_num(latest["score_range"]),
-            "reversal": _safe_num(latest["score_reversal"]),
-            "momentum": _safe_num(latest["score_momentum"]),
-        },
+        "close": _safe_num(result["active_status"][-1]["close"]),
+        "change_pct": _latest_change_pct(window),
+        "signal": current["signal"],
+        "signal_source": current["signal_source"],
+        "signal_started_date": current["signal_started_date"],
+        "signal_trading_days": current["signal_trading_days"],
+        "position_strength": current["position_strength"],
+        "ticker_success_rate_52w": sr["success_rate"],
+        "ticker_trade_count_52w": sr["trade_count"],
     }
 
-    history = {
+    # Per-ticker history payload is compact — only fields the app renders.
+    hist_rows = []
+    # Build a lookup from date -> volume from the window frame.
+    vol_by_date = {
+        str(d)[:10]: v
+        for d, v in zip(window["date"], window["volume"])
+    }
+
+    for row in result["active_status"]:
+        hist_rows.append({
+            "date": row["date"],
+            "close": _safe_num(row["close"]),
+            "volume": int(vol_by_date[row["date"]])
+                if row["date"] in vol_by_date and pd.notna(vol_by_date[row["date"]])
+                else None,
+            "signal": row["signal"],
+            "psar": _safe_num(row["psar"]),
+        })
+
+    history_payload = {
         "ticker": ticker,
         "schema_version": SCHEMA_VERSION,
-        "history": [_row_to_history(r) for _, r in df.iterrows()],
+        "current": {
+            "signal": current["signal"],
+            "signal_source": current["signal_source"],
+            "signal_started_date": current["signal_started_date"],
+            "signal_trading_days": current["signal_trading_days"],
+            "position_strength": current["position_strength"],
+        },
+        "success_rate": sr,
+        "history": hist_rows,
     }
-    return summary, history
+
+    return summary, history_payload, result["trades"]
 
 
 def run(tickers: list[str], cache_dir: Path, out_dir: Path,
@@ -212,14 +227,12 @@ def run(tickers: list[str], cache_dir: Path, out_dir: Path,
     out_dir.mkdir(parents=True, exist_ok=True)
     (out_dir / "tickers").mkdir(parents=True, exist_ok=True)
 
-    # Step 1: ensure cache exists.
     if do_backfill:
         print(f"Backfilling {len(tickers)} tickers...")
         failures = fetch.backfill_universe(tickers, cache_dir)
         if failures:
             print(f"  {len(failures)} failures: {failures[:10]}...")
 
-    # Step 2: bulk append today's bar to every ticker.
     print("Fetching bulk last-day data...")
     try:
         bulk = fetch.fetch_bulk_last_day()
@@ -227,23 +240,25 @@ def run(tickers: list[str], cache_dir: Path, out_dir: Path,
     except Exception as e:  # noqa: BLE001
         print(f"[bulk] failed: {e} — proceeding with cached data")
 
-    # Step 3: process each ticker.
     summaries = []
+    all_trades: list[dict] = []
     for t in tickers:
         df = fetch.load_cache(t, cache_dir)
         result = process_ticker(t, df)
         if result is None:
             continue
-        summary, history = result
+        summary, history, trades = result
         summaries.append(summary)
+        all_trades.extend(trades)
         with open(out_dir / "tickers" / f"{t}.json", "w") as f:
             json.dump(history, f, separators=(",", ":"))
 
-    # Step 4: write home-screen payload.
+    # Strategy-wide success rate aggregated across all tickers' trades.
+    agg = consensus.aggregate_strategy_success_rate(all_trades)
+
     trade_date = None
     if summaries:
-        # Find the latest trade date from the first ticker's cache.
-        any_ticker = next(iter(summaries))["ticker"]
+        any_ticker = summaries[0]["ticker"]
         df = fetch.load_cache(any_ticker, cache_dir)
         if not df.empty:
             trade_date = df["date"].max().strftime("%Y-%m-%d")
@@ -253,9 +268,16 @@ def run(tickers: list[str], cache_dir: Path, out_dir: Path,
         "generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
         "trade_date": trade_date,
         "universe_size": len(summaries),
+        "strategy_success_rate_52w": agg["success_rate"],
+        "strategy_trade_count_52w": agg["trade_count"],
         "signals": summaries,
     }
     with open(out_dir / "signals.json", "w") as f:
         json.dump(payload, f, separators=(",", ":"))
 
-    print(f"Done. {len(summaries)} tickers processed.")
+    buy_count = sum(1 for s in summaries if s["signal"] == "BUY")
+    sell_count = sum(1 for s in summaries if s["signal"] == "SELL")
+    none_count = sum(1 for s in summaries if s["signal"] is None)
+    print(f"Done. {len(summaries)} tickers processed. "
+          f"BUY={buy_count} SELL={sell_count} CASH={none_count}. "
+          f"Strategy 52w success: {agg['success_rate']} across {agg['trade_count']} trades.")
