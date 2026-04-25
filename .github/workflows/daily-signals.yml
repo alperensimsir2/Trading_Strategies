@@ -47,17 +47,22 @@ jobs:
           python - <<EOF
           import datetime
           import pandas_market_calendars as mcal
-
-          nyse = mcal.get_calendar("NYSE")
-          end_dt = datetime.datetime.utcnow()
-          start_dt = end_dt - datetime.timedelta(days=1)
-          schedule = nyse.schedule(start_date=start_dt.date(), end_date=end_dt.date())
-
-          is_open = "true" if not schedule.empty else "false"
-          print(f"Market session found in window: {is_open}")
-
-
           import os
+
+          # Get the NYSE calendar
+          nyse = mcal.get_calendar("NYSE")
+          
+          # Check a 24-hour window to account for the UTC date flip
+          now = datetime.datetime.utcnow()
+          yesterday = now - datetime.timedelta(days=1)
+          
+          # Check if either today or yesterday was a valid trading session
+          schedule = nyse.schedule(start_date=yesterday.date(), end_date=now.date())
+          
+          is_open = "true" if not schedule.empty else "false"
+          print(f"Market session active in window: {is_open}")
+          
+          # Write to GITHUB_ENV so the next steps can see it
           with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write(f"MARKET_OPEN={is_open}\n")
           EOF
