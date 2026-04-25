@@ -49,13 +49,16 @@ jobs:
           import pandas_market_calendars as mcal
 
           nyse = mcal.get_calendar("NYSE")
-          today = datetime.datetime.utcnow().date()
-          schedule = nyse.schedule(start_date=today, end_date=today)
+          end_dt = datetime.datetime.utcnow()
+          start_dt = end_dt - datetime.timedelta(days=1)
+          schedule = nyse.schedule(start_date=start_dt.date(), end_date=end_dt.date())
 
           is_open = "true" if not schedule.empty else "false"
-          print(f"is_open={is_open}")
+          print(f"Market session found in window: {is_open}")
 
-          with open("${{ github.env }}", "a") as f:
+
+          import os
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write(f"MARKET_OPEN={is_open}\n")
           EOF
 
