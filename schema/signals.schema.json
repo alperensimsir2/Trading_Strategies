@@ -1,16 +1,18 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "signals.json (home-screen payload, v2.0.0)",
-  "description": "Daily per-ticker signal + metadata. Replaces the 8-state consensus model with BUY/SELL/null from the 15/4 pivot + PSAR strategy.",
+  "title": "signals.json (home-screen payload, v2.1.0)",
   "type": "object",
   "required": ["schema_version", "generated_at", "signals"],
   "properties": {
-    "schema_version": {"type": "string", "const": "2.0.0"},
+    "schema_version": {"type": "string", "const": "2.1.0"},
     "generated_at": {"type": "string", "format": "date-time"},
     "trade_date": {"type": ["string", "null"], "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}$"},
     "universe_size": {"type": "integer", "minimum": 0},
-    "strategy_success_rate_52w": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
     "strategy_trade_count_52w": {"type": "integer", "minimum": 0},
+    "strategy_avg_hold_days": {"type": ["number", "null"]},
+    "strategy_avg_gain_pct": {"type": ["number", "null"]},
+    "strategy_avg_peak_gain_pct": {"type": ["number", "null"], "minimum": 0.0},
+    "strategy_success_rate_52w": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
     "signals": {
       "type": "array",
       "items": {
@@ -28,8 +30,11 @@
             "type": ["string", "null"],
             "enum": ["Strong", "Moderate", "Close to flipping", null]
           },
-          "ticker_success_rate_52w": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
-          "ticker_trade_count_52w": {"type": "integer", "minimum": 0}
+          "ticker_trade_count_52w": {"type": "integer", "minimum": 0},
+          "ticker_avg_hold_days": {"type": ["number", "null"]},
+          "ticker_avg_gain_pct": {"type": ["number", "null"]},
+          "ticker_avg_peak_gain_pct": {"type": ["number", "null"], "minimum": 0.0},
+          "ticker_success_rate_52w": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0}
         }
       }
     }

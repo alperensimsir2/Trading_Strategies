@@ -1,12 +1,11 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "title": "tickers/{TICKER}.json (per-ticker history, v2.0.0)",
-  "description": "Full 52w signal history + current position metadata for one ticker.",
+  "title": "tickers/{TICKER}.json (per-ticker history, v2.1.0)",
   "type": "object",
   "required": ["ticker", "schema_version", "history"],
   "properties": {
     "ticker": {"type": "string"},
-    "schema_version": {"type": "string", "const": "2.0.0"},
+    "schema_version": {"type": "string", "const": "2.1.0"},
     "current": {
       "type": "object",
       "properties": {
@@ -20,12 +19,15 @@
         }
       }
     },
-    "success_rate": {
+    "metrics": {
       "type": "object",
-      "required": ["success_rate", "trade_count"],
+      "required": ["trade_count"],
       "properties": {
-        "success_rate": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0},
-        "trade_count": {"type": "integer", "minimum": 0}
+        "trade_count": {"type": "integer", "minimum": 0},
+        "avg_hold_days": {"type": ["number", "null"]},
+        "avg_gain_pct": {"type": ["number", "null"]},
+        "avg_peak_gain_pct": {"type": ["number", "null"], "minimum": 0.0},
+        "success_rate": {"type": ["number", "null"], "minimum": 0.0, "maximum": 1.0}
       }
     },
     "history": {

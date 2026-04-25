@@ -1,19 +1,20 @@
 """
 Merge + state expansion + performance metrics.
 
-This module used to compute cross-strategy "consensus" from four independent
-strategies. The new model is different — there's a primary pivot-based
-strategy and a secondary snap-back strategy. Both produce entry signals
-(BUY/SELL on specific days). This module:
+This module:
 
   1. Merges primary and secondary entries (secondary wins on same-day conflict).
   2. Expands entry events into a persistent active state per day: BUY, SELL,
-     or None. Positions persist until PSAR flips against the trade (same exit
-     rule as the reference PHP).
-  3. Computes per-ticker success rate over the last 52 trading weeks (260 bars).
-  4. Classifies current position strength based on distance from PSAR.
+     or None. Positions persist until PSAR flips against the trade.
+  3. Computes per-ticker performance metrics over the last 52 trading weeks:
+     - trade_count
+     - avg_hold_days     (calendar days entry-to-exit, mean)
+     - avg_gain_pct      (realized PnL at PSAR exit, signed)
+     - avg_peak_gain_pct (Maximum Favorable Excursion, floored at 0%)
+     - success_rate      (kept for internal use; not displayed in app)
+  4. Classifies current position strength based on close-to-PSAR distance.
 
-All of this is pure data transformation — no side effects, no I/O.
+All of this is pure data transformation.
 """
 
 from __future__ import annotations
@@ -30,45 +31,39 @@ def merge_entries(primary: dict[str, str],
     """
     Merge two signal dicts into one, keyed by date.
 
-    Values are (side, source): side is 'BUY' or 'SELL', source is
-    'primary' or 'secondary'.
-
-    On same-day conflict, secondary wins. (This matches the PHP: trend
-    continuation shouldn't be obscured by a coincident trend reversal.)
+    Values are (side, source). On same-day conflict, secondary wins.
     """
     merged: dict[str, tuple[str, str]] = {}
     for date, side in primary.items():
         merged[date] = (side, "primary")
     for date, side in secondary.items():
-        merged[date] = (side, "secondary")  # overwrites any primary on same day
+        merged[date] = (side, "secondary")
     return merged
 
 
-# ===== Expand entries to persistent BUY/SELL/None state ====================
+# ===== Expand entries to persistent BUY/SELL/None state =====================
 
 def expand_signals_to_active_status(
     df_asc: pd.DataFrame,
     entry_signals: dict[str, tuple[str, str]],
 ) -> list[dict]:
     """
-    Walk the ASC-ordered bars. At each bar:
-      - If today is an entry day: set current state to the entry side
-        (BUY or SELL), and remember the entry date + source.
-      - Else if in BUY and close < PSAR: exit to cash (state = None).
-      - Else if in SELL and close > PSAR: exit to cash (state = None).
-      - Else: hold current state.
+    Walk ASC-ordered bars. Each bar is in one of three states:
+      - In a BUY position
+      - In a SELL position
+      - In cash (None)
 
-    Returns a list of dicts, one per bar, aligned with df_asc:
-      {
-        'date': 'YYYY-MM-DD',
-        'close': float or None,
-        'psar': float or None,
-        'signal': 'BUY'|'SELL'|None,
-        'signal_source': 'primary'|'secondary'|None,
-        'signal_started_date': 'YYYY-MM-DD' or None,
-      }
+    Transitions:
+      - Entry day: state := entry signal's side
+      - In BUY and close < PSAR: exit to cash
+      - In SELL and close > PSAR: exit to cash
+      - Otherwise: hold
 
-    The None values in `signal` represent "cash" days — not an active position.
+    Returns one dict per bar with all the data trade reconstruction needs:
+      {date, close, high, low, psar, signal, signal_source, signal_started_date}
+
+    high/low are included so peak-gain (MFE) can be computed without re-walking
+    the source frame.
     """
     from .strategies import _date_to_str  # local import to avoid cycles
     out: list[dict] = []
@@ -83,20 +78,20 @@ def expand_signals_to_active_status(
             continue
 
         close = row.get("close")
+        high = row.get("high")
+        low = row.get("low")
         psar = row.get("psar")
         close_v = float(close) if pd.notna(close) else None
+        high_v = float(high) if pd.notna(high) else None
+        low_v = float(low) if pd.notna(low) else None
         psar_v = float(psar) if pd.notna(psar) else None
 
-        # Entry (including flip).
         if date in entry_signals:
             side, src = entry_signals[date]
-            # If we're already in the same side, don't reset started/source —
-            # this preserves "signal has been active since X" through re-entries.
             if state != side:
                 state = side
                 source = src
                 started = date
-        # Exit check (PSAR flip against position).
         elif state == "BUY" and close_v is not None and psar_v is not None and close_v < psar_v:
             state = None
             source = None
@@ -109,6 +104,8 @@ def expand_signals_to_active_status(
         out.append({
             "date": date,
             "close": close_v,
+            "high": high_v,
+            "low": low_v,
             "psar": psar_v,
             "signal": state,
             "signal_source": source,
@@ -118,51 +115,78 @@ def expand_signals_to_active_status(
     return out
 
 
-# ===== Trade reconstruction + success rate ==================================
+# ===== Trade reconstruction =================================================
 
 def _extract_trades(active_status: list[dict]) -> list[dict]:
     """
     Walk the per-bar active status and extract completed trades.
 
-    A trade runs from the day it entered (signal changed from None/flip) to
-    the day it exited (signal went back to None due to PSAR flip). A trade
-    where the side flips (BUY -> SELL or vice versa) produces TWO trades:
-    the old position closed at the flip date, and a new one opened there.
+    A trade runs from the day of entry to the day of exit (when signal flips
+    or exits to cash). Per-trade metrics computed:
+      - pnl_pct        : realized PnL at exit, signed
+      - peak_gain_pct  : Maximum Favorable Excursion using intraday high (BUY)
+                         or intraday low (SELL). Floored at 0%.
+      - hold_days      : calendar days between entry and exit dates
+      - profitable     : pnl_pct > 0
 
-    Returns list of dicts:
-      {
-        'entry_date': str,
-        'entry_close': float,
-        'exit_date': str,
-        'exit_close': float,
-        'side': 'BUY'|'SELL',
-        'source': 'primary'|'secondary',
-        'profitable': bool,  # BUY: exit>entry; SELL: exit<entry
-        'pnl_pct': float,    # signed % return (positive = profitable for both sides)
-      }
-
-    Open (unfilled) trades at the end of the series are NOT included — we only
-    count completed trades where we know the outcome.
+    Open trades at the end of the series are NOT included (we don't know the
+    outcome yet).
     """
     trades: list[dict] = []
     prev_side: Optional[str] = None
     prev_source: Optional[str] = None
     entry_date: Optional[str] = None
     entry_close: Optional[float] = None
+    peak_price: Optional[float] = None  # max high for BUY, min low for SELL
 
     for bar in active_status:
         side = bar["signal"]
         close = bar["close"]
+        high = bar.get("high")
+        low = bar.get("low")
+
+        # Update running peak tracker BEFORE processing transitions, so the
+        # exit bar's intraday extreme is included in the trade's MFE.
+        if prev_side == "BUY" and high is not None:
+            if peak_price is None or high > peak_price:
+                peak_price = high
+        elif prev_side == "SELL" and low is not None:
+            if peak_price is None or low < peak_price:
+                peak_price = low
 
         if side != prev_side:
-            # Position change. Close out previous (if any).
-            if prev_side in ("BUY", "SELL") and entry_date is not None and entry_close is not None and close is not None:
+            # Close out previous position.
+            if (prev_side in ("BUY", "SELL")
+                    and entry_date is not None
+                    and entry_close is not None
+                    and close is not None):
+
+                # Realized PnL.
                 if prev_side == "BUY":
                     pnl_pct = (close - entry_close) / entry_close * 100.0
                     profitable = close > entry_close
-                else:  # SELL
+                else:
                     pnl_pct = (entry_close - close) / entry_close * 100.0
                     profitable = close < entry_close
+
+                # Peak gain (MFE).
+                if peak_price is not None:
+                    if prev_side == "BUY":
+                        peak_gain_pct = (peak_price - entry_close) / entry_close * 100.0
+                    else:
+                        peak_gain_pct = (entry_close - peak_price) / entry_close * 100.0
+                    peak_gain_pct = max(0.0, peak_gain_pct)
+                else:
+                    peak_gain_pct = 0.0
+
+                # Hold time in calendar days.
+                try:
+                    hold_days = (pd.Timestamp(bar["date"]) - pd.Timestamp(entry_date)).days
+                    if hold_days < 0:
+                        hold_days = 0
+                except Exception:
+                    hold_days = 0
+
                 trades.append({
                     "entry_date": entry_date,
                     "entry_close": entry_close,
@@ -172,59 +196,127 @@ def _extract_trades(active_status: list[dict]) -> list[dict]:
                     "source": prev_source or "primary",
                     "profitable": bool(profitable),
                     "pnl_pct": round(pnl_pct, 4),
+                    "peak_gain_pct": round(peak_gain_pct, 4),
+                    "hold_days": int(hold_days),
                 })
-            # Open new (if we entered a position, not just exited to cash).
+
+            # Open new position (or transition to cash).
             if side in ("BUY", "SELL") and close is not None:
                 entry_date = bar["date"]
                 entry_close = close
                 prev_source = bar.get("signal_source")
+                # Initialize peak with today's intraday extreme.
+                if side == "BUY":
+                    peak_price = high if high is not None else close
+                else:
+                    peak_price = low if low is not None else close
             else:
                 entry_date = None
                 entry_close = None
                 prev_source = None
+                peak_price = None
+
             prev_side = side
 
     return trades
 
 
-def compute_ticker_success_rate(active_status: list[dict],
-                                min_trades: int = 5) -> dict:
+# ===== Per-ticker metrics ===================================================
+
+def compute_ticker_metrics(active_status: list[dict],
+                            min_trades: int = 5) -> dict:
     """
-    Compute success rate over the full active_status window (which should be
-    the last 260 bars = 52 trading weeks).
+    Compute all per-ticker performance metrics over the active_status window.
 
     Returns:
       {
-        'success_rate': float or None,  # 0.0-1.0, None if not enough trades
-        'trade_count': int,
+        'trade_count':        int,
+        'avg_hold_days':      float | None,    # mean calendar days
+        'avg_gain_pct':       float | None,    # mean realized PnL, signed
+        'avg_peak_gain_pct':  float | None,    # mean MFE, >= 0
+        'success_rate':       float | None,    # kept for internal use
       }
 
-    When trade_count < min_trades, success_rate is None (insufficient data).
+    When trade_count < min_trades, all aggregate values are None (insufficient
+    data). trade_count itself is always populated.
     """
     trades = _extract_trades(active_status)
     count = len(trades)
-    if count == 0:
-        return {"success_rate": None, "trade_count": 0}
+
+    null_metrics = {
+        "trade_count": count,
+        "avg_hold_days": None,
+        "avg_gain_pct": None,
+        "avg_peak_gain_pct": None,
+        "success_rate": None,
+    }
     if count < min_trades:
-        return {"success_rate": None, "trade_count": count}
+        return null_metrics
 
+    avg_hold = sum(t["hold_days"] for t in trades) / count
+    avg_gain = sum(t["pnl_pct"] for t in trades) / count
+    avg_peak = sum(t["peak_gain_pct"] for t in trades) / count
     wins = sum(1 for t in trades if t["profitable"])
-    rate = wins / count
-    return {"success_rate": round(rate, 4), "trade_count": count}
+
+    return {
+        "trade_count": count,
+        "avg_hold_days": round(avg_hold, 1),
+        "avg_gain_pct": round(avg_gain, 4),
+        "avg_peak_gain_pct": round(avg_peak, 4),
+        "success_rate": round(wins / count, 4),
+    }
 
 
-def aggregate_strategy_success_rate(all_trades: list[dict]) -> dict:
+# Backwards-compat shim for any caller that still uses the old name.
+def compute_ticker_success_rate(active_status: list[dict],
+                                 min_trades: int = 5) -> dict:
+    metrics = compute_ticker_metrics(active_status, min_trades=min_trades)
+    return {
+        "success_rate": metrics["success_rate"],
+        "trade_count": metrics["trade_count"],
+    }
+
+
+# ===== Strategy-wide aggregation ============================================
+
+def aggregate_strategy_metrics(all_trades: list[dict]) -> dict:
     """
-    Compute strategy-wide success rate across trades from all tickers.
+    Compute strategy-wide aggregate metrics across trades from all tickers.
+    Kept in JSON for debugging/internal use; not surfaced in the app UI.
 
-    Returns the same shape as compute_ticker_success_rate (success_rate is
-    None if no trades at all).
+    Returns same shape as compute_ticker_metrics. min_trades is not enforced
+    at the strategy level — even one trade gives a meaningful number when
+    aggregated across the universe.
     """
     count = len(all_trades)
     if count == 0:
-        return {"success_rate": None, "trade_count": 0}
+        return {
+            "trade_count": 0,
+            "avg_hold_days": None,
+            "avg_gain_pct": None,
+            "avg_peak_gain_pct": None,
+            "success_rate": None,
+        }
+    avg_hold = sum(t["hold_days"] for t in all_trades) / count
+    avg_gain = sum(t["pnl_pct"] for t in all_trades) / count
+    avg_peak = sum(t["peak_gain_pct"] for t in all_trades) / count
     wins = sum(1 for t in all_trades if t["profitable"])
-    return {"success_rate": round(wins / count, 4), "trade_count": count}
+    return {
+        "trade_count": count,
+        "avg_hold_days": round(avg_hold, 1),
+        "avg_gain_pct": round(avg_gain, 4),
+        "avg_peak_gain_pct": round(avg_peak, 4),
+        "success_rate": round(wins / count, 4),
+    }
+
+
+# Old name kept as alias.
+def aggregate_strategy_success_rate(all_trades: list[dict]) -> dict:
+    metrics = aggregate_strategy_metrics(all_trades)
+    return {
+        "success_rate": metrics["success_rate"],
+        "trade_count": metrics["trade_count"],
+    }
 
 
 # ===== Position strength classification =====================================
@@ -236,11 +328,11 @@ def classify_position_strength(close: Optional[float],
     Classify how "safe" the current position is based on distance from PSAR.
 
     Buckets:
-      - 'Strong'            : price is > 5% away from PSAR (lots of room)
-      - 'Moderate'          : price is 2% to 5% away
-      - 'Close to flipping' : price is < 2% away
+      - 'Strong'            : close is > 5% away from PSAR
+      - 'Moderate'          : close is 2% to 5% away
+      - 'Close to flipping' : close is < 2% away
 
-    When signal is None (in cash), returns None.
+    Returns None when signal is None (in cash).
     """
     if signal not in ("BUY", "SELL"):
         return None
@@ -248,7 +340,6 @@ def classify_position_strength(close: Optional[float],
         return None
 
     dist_pct = abs(close - psar) / abs(psar) * 100.0
-
     if dist_pct >= 5.0:
         return "Strong"
     if dist_pct >= 2.0:
@@ -258,13 +349,7 @@ def classify_position_strength(close: Optional[float],
 
 def days_since(start_date_str: Optional[str],
                current_date_str: Optional[str]) -> Optional[int]:
-    """
-    Count trading days from start to current (inclusive of both ends → +1).
-
-    Uses simple calendar-day arithmetic then divides by (7/5) as an approximation.
-    This is close enough for UI display; for exactness, the caller should pass
-    a pre-computed trading-days count.
-    """
+    """Approx trading days between two dates (calendar * 5/7)."""
     if start_date_str is None or current_date_str is None:
         return None
     try:
@@ -275,32 +360,17 @@ def days_since(start_date_str: Optional[str],
     delta_days = (b - a).days
     if delta_days < 0:
         return None
-    # Approximate trading days = calendar days * 5/7.
     return int(round(delta_days * 5 / 7))
 
 
-# ===== Convenience: run everything for one ticker ==========================
+# ===== Convenience: process one ticker end-to-end ===========================
 
 def process_ticker_signals(df_asc: pd.DataFrame,
                             primary_entries: dict[str, str],
                             secondary_entries: dict[str, str]) -> dict:
     """
-    One-stop call combining merge + expansion + success rate + current
-    position classification.
-
-    Returns:
-      {
-        'active_status': [ {date, close, psar, signal, ...}, ... ],  # full history
-        'trades': [ {entry_date, exit_date, side, ...}, ... ],
-        'current': {
-          'signal': 'BUY'|'SELL'|None,
-          'signal_source': 'primary'|'secondary'|None,
-          'signal_started_date': str or None,
-          'signal_trading_days': int or None,
-          'position_strength': 'Strong'|'Moderate'|'Close to flipping'|None,
-        },
-        'success_rate': {'success_rate': float|None, 'trade_count': int},
-      }
+    Full per-ticker pipeline: merge entries, expand to active state, compute
+    trades + metrics, classify current position.
     """
     merged = merge_entries(primary_entries, secondary_entries)
     active = expand_signals_to_active_status(df_asc, merged)
@@ -316,12 +386,18 @@ def process_ticker_signals(df_asc: pd.DataFrame,
                 "signal_trading_days": None,
                 "position_strength": None,
             },
-            "success_rate": {"success_rate": None, "trade_count": 0},
+            "metrics": {
+                "trade_count": 0,
+                "avg_hold_days": None,
+                "avg_gain_pct": None,
+                "avg_peak_gain_pct": None,
+                "success_rate": None,
+            },
         }
 
     latest = active[-1]
     trades = _extract_trades(active)
-    sr = compute_ticker_success_rate(active)
+    metrics = compute_ticker_metrics(active)
 
     current = {
         "signal": latest["signal"],
@@ -337,5 +413,5 @@ def process_ticker_signals(df_asc: pd.DataFrame,
         "active_status": active,
         "trades": trades,
         "current": current,
-        "success_rate": sr,
+        "metrics": metrics,
     }
