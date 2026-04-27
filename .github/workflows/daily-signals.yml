@@ -32,7 +32,6 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyarrow pandas_market_calendars
-
       - name: Restore cache
         uses: actions/cache@v4
         with:
@@ -40,7 +39,6 @@ jobs:
           key: ticker-cache-${{ github.run_id }}
           restore-keys: |
             ticker-cache-
-
       - name: Check if market is open day
         id: market_day
         run: |
@@ -48,7 +46,6 @@ jobs:
           import datetime
           import pandas_market_calendars as mcal
           import os
-
           # Get the NYSE calendar
           nyse = mcal.get_calendar("NYSE")
           
@@ -66,7 +63,6 @@ jobs:
           with open(os.environ['GITHUB_ENV'], 'a') as f:
               f.write(f"MARKET_OPEN={is_open}\n")
           EOF
-
       - name: Run pipeline
         if: env.MARKET_OPEN == 'true'
         env:
@@ -77,7 +73,6 @@ jobs:
           else
             python -m src
           fi
-
       - name: Upload artifact (debugging)
         if: env.MARKET_OPEN == 'true'
         uses: actions/upload-artifact@v4
