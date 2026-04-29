@@ -133,6 +133,12 @@ def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict, list[dict
     current = result["current"]
     metrics = result["metrics"]
 
+    # If there's an active trade, pull its peak gain. The active trade is the
+    # last entry in result["trades"] when is_active is True.
+    active_peak_gain_pct = None
+    if result["trades"] and result["trades"][-1].get("is_active"):
+        active_peak_gain_pct = result["trades"][-1]["peak_gain_pct"]
+
     summary = {
         "ticker": ticker,
         "close": _safe_num(result["active_status"][-1]["close"]),
@@ -142,6 +148,7 @@ def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict, list[dict
         "signal_started_date": current["signal_started_date"],
         "signal_trading_days": current["signal_trading_days"],
         "position_strength": current["position_strength"],
+        "active_peak_gain_pct": active_peak_gain_pct,
         "ticker_trade_count_52w": metrics["trade_count"],
         "ticker_avg_hold_days": metrics["avg_hold_days"],
         "ticker_avg_gain_pct": metrics["avg_gain_pct"],
@@ -174,6 +181,7 @@ def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict, list[dict
             "signal_started_date": current["signal_started_date"],
             "signal_trading_days": current["signal_trading_days"],
             "position_strength": current["position_strength"],
+            "peak_gain_pct": active_peak_gain_pct,
         },
         "metrics": {
             "trade_count": metrics["trade_count"],
