@@ -119,18 +119,23 @@ def expand_signals_to_active_status(
 
 def _extract_trades(active_status: list[dict]) -> list[dict]:
     """
-    Walk the per-bar active status and extract completed trades.
+    Walk the per-bar active status and extract trades.
 
     A trade runs from the day of entry to the day of exit (when signal flips
     or exits to cash). Per-trade metrics computed:
-      - pnl_pct        : realized PnL at exit, signed
+      - pnl_pct        : realized PnL at exit, signed (snapshot for active)
       - peak_gain_pct  : Maximum Favorable Excursion using intraday high (BUY)
                          or intraday low (SELL). Floored at 0%.
       - hold_days      : calendar days between entry and exit dates
       - profitable     : pnl_pct > 0
+      - is_active      : True if this is an in-progress trade, False if closed
 
-    Open trades at the end of the series are NOT included (we don't know the
-    outcome yet).
+    The CURRENTLY-OPEN position (if any) is included as the final trade with
+    is_active=True. Its exit_date and exit_close are set to today's bar (the
+    last in active_status), so peak_gain_pct reflects the best moment so far
+    and hold_days reflects days-in-trade so far. The pnl_pct field is a
+    snapshot of unrealized PnL — useful for debugging but mixes apples and
+    oranges with closed trades' realized PnL.
     """
     trades: list[dict] = []
     prev_side: Optional[str] = None
@@ -198,6 +203,7 @@ def _extract_trades(active_status: list[dict]) -> list[dict]:
                     "pnl_pct": round(pnl_pct, 4),
                     "peak_gain_pct": round(peak_gain_pct, 4),
                     "hold_days": int(hold_days),
+                    "is_active": False,
                 })
 
             # Open new position (or transition to cash).
@@ -217,6 +223,69 @@ def _extract_trades(active_status: list[dict]) -> list[dict]:
                 peak_price = None
 
             prev_side = side
+
+    # If we exit the loop while still holding a position, synthesize a final
+    # "active" trade snapshot using the last bar's data. This includes the
+    # current open position in the metrics (peak gain so far, days-in-trade
+    # so far) rather than excluding it as if it didn't exist.
+    if (prev_side in ("BUY", "SELL")
+            and entry_date is not None
+            and entry_close is not None
+            and active_status):
+
+        last_bar = active_status[-1]
+        last_close = last_bar.get("close")
+        last_high = last_bar.get("high")
+        last_low = last_bar.get("low")
+
+        # Final peak update for the last bar's intraday extreme.
+        if prev_side == "BUY" and last_high is not None:
+            if peak_price is None or last_high > peak_price:
+                peak_price = last_high
+        elif prev_side == "SELL" and last_low is not None:
+            if peak_price is None or last_low < peak_price:
+                peak_price = last_low
+
+        if last_close is not None:
+            # Snapshot unrealized PnL.
+            if prev_side == "BUY":
+                pnl_pct = (last_close - entry_close) / entry_close * 100.0
+                profitable = last_close > entry_close
+            else:
+                pnl_pct = (entry_close - last_close) / entry_close * 100.0
+                profitable = last_close < entry_close
+
+            # Peak gain so far.
+            if peak_price is not None:
+                if prev_side == "BUY":
+                    peak_gain_pct = (peak_price - entry_close) / entry_close * 100.0
+                else:
+                    peak_gain_pct = (entry_close - peak_price) / entry_close * 100.0
+                peak_gain_pct = max(0.0, peak_gain_pct)
+            else:
+                peak_gain_pct = 0.0
+
+            # Days in trade so far.
+            try:
+                hold_days = (pd.Timestamp(last_bar["date"]) - pd.Timestamp(entry_date)).days
+                if hold_days < 0:
+                    hold_days = 0
+            except Exception:
+                hold_days = 0
+
+            trades.append({
+                "entry_date": entry_date,
+                "entry_close": entry_close,
+                "exit_date": last_bar["date"],
+                "exit_close": last_close,
+                "side": prev_side,
+                "source": prev_source or "primary",
+                "profitable": bool(profitable),
+                "pnl_pct": round(pnl_pct, 4),
+                "peak_gain_pct": round(peak_gain_pct, 4),
+                "hold_days": int(hold_days),
+                "is_active": True,
+            })
 
     return trades
 
