@@ -139,6 +139,14 @@ def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict, list[dict
     if result["trades"] and result["trades"][-1].get("is_active"):
         active_peak_gain_pct = result["trades"][-1]["peak_gain_pct"]
 
+    # Sparkline: last 30 trading days of close prices for the home-row chart.
+    # Used by tablet/wide-layout list rows to show trend at a glance.
+    sparkline_closes = [
+        _safe_num(row["close"]) for row in result["active_status"][-30:]
+    ]
+    # Filter out any None values defensively (shouldn't happen but be safe)
+    sparkline_closes = [v for v in sparkline_closes if v is not None]
+
     summary = {
         "ticker": ticker,
         "close": _safe_num(result["active_status"][-1]["close"]),
@@ -149,6 +157,7 @@ def process_ticker(ticker: str, df: pd.DataFrame) -> tuple[dict, dict, list[dict
         "signal_trading_days": current["signal_trading_days"],
         "position_strength": current["position_strength"],
         "active_peak_gain_pct": active_peak_gain_pct,
+        "sparkline": sparkline_closes,
         "ticker_trade_count_52w": metrics["trade_count"],
         "ticker_avg_hold_days": metrics["avg_hold_days"],
         "ticker_avg_gain_pct": metrics["avg_gain_pct"],
